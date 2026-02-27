@@ -49,6 +49,8 @@ if not ACCOUNT_SID or not AUTH_TOKEN:
 
 AUTH = HTTPBasicAuth(ACCOUNT_SID, AUTH_TOKEN)
 
+app = Flask(__name__)
+
 def get_google_creds():
     """Load Google creds from base64 env var or local file."""
     b64 = os.getenv("GOOGLE_CREDENTIALS_JSON")
