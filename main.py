@@ -12,7 +12,8 @@ from collections import defaultdict
 
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
-
+from flask import Flask
+import threading
 # ==========================================================
 # CONFIG
 # ==========================================================
@@ -530,5 +531,14 @@ def main():
     
     print(f"\n🎉 SYNC COMPLETE — {len(master_rows)} rows synced.")
 
-if __name__ == "__main__":
+def run_sync():
     main()
+
+
+if __name__ == "__main__":
+    # Start your sync logic in a background thread
+    threading.Thread(target=run_sync).start()
+
+    # Bind to Render-required host + port
+    port = int(os.environ.get("PORT", 10000))
+    app.run(host="0.0.0.0", port=port)
