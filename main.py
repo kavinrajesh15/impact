@@ -10,7 +10,7 @@ import logging
 import requests
 import threading
 from requests.auth import HTTPBasicAuth
-from datetime import datetime, timedelta
+from datetime import datetime, timezone, timedelta
 from collections import defaultdict
 
 from google.oauth2 import service_account
@@ -18,7 +18,7 @@ from googleapiclient.discovery import build
 from flask import Flask, jsonify, request
 
 # ==========================================================
-# LOGGING — structured, goes to Render's log stream
+# LOGGING
 # ==========================================================
 logging.basicConfig(
     level=logging.INFO,
@@ -28,66 +28,79 @@ logging.basicConfig(
 log = logging.getLogger(__name__)
 
 # ==========================================================
-# ENV VALIDATION — fail with a clear message, not a traceback
+# ENV
 # ==========================================================
-def _require_env(name: str) -> str:
-    val = os.getenv(name)
-    if not val:
-        log.error(f"FATAL: Missing required env var: {name}")
-        # Don't sys.exit here — let Flask start and report the error via /health
-    return val or ""
-
 try:
     from dotenv import load_dotenv
     load_dotenv()
 except ImportError:
     pass
 
-ACCOUNT_SID  = _require_env("IMPACT_ACCOUNT_SID")
-AUTH_TOKEN   = _require_env("IMPACT_AUTH_TOKEN")
-SPREADSHEET_ID = os.getenv("SPREADSHEET_ID", "")
+def _require_env(name: str) -> str:
+    val = os.getenv(name)
+    if not val:
+        log.error(f"FATAL: Missing required env var: {name}")
+    return val or ""
 
-AUTH = HTTPBasicAuth(ACCOUNT_SID, AUTH_TOKEN) if ACCOUNT_SID and AUTH_TOKEN else None
+ACCOUNT_SID    = _require_env("IMPACT_ACCOUNT_SID")
+AUTH_TOKEN     = _require_env("IMPACT_AUTH_TOKEN")
+SPREADSHEET_ID = os.getenv("SPREADSHEET_ID", "")
+AUTH           = HTTPBasicAuth(ACCOUNT_SID, AUTH_TOKEN) if ACCOUNT_SID and AUTH_TOKEN else None
 
 # ==========================================================
 # CONFIG
 # ==========================================================
-IMPACT_BASE_URL          = "https://api.impact.com"
-SHEET_MAIN_AGGREGATE     = "Sheet1"
-CHUNK_DAYS               = 30
-PAGE_SIZE                = 5000
-RATE_LIMIT_DELAY         = 0.5
-CLICK_POLL_INTERVAL      = 5
-CLICK_MAX_POLLS          = 60
-CLICK_BETWEEN_CAMPAIGNS  = 30
-CLICK_429_MAX_RETRIES    = 5
-CLICK_429_BASE_WAIT      = 60
-CLICK_429_MAX_WAIT       = 120
-MAX_PAGES_PER_CHUNK      = 200   # safety cap — prevents infinite pagination loops
+IMPACT_BASE_URL         = "https://api.impact.com"
+SHEET_MAIN_AGGREGATE    = "Sheet1"
+CHUNK_DAYS              = 30
+PAGE_SIZE               = 5000
+RATE_LIMIT_DELAY        = 0.5
+CLICK_POLL_INTERVAL     = 5
+CLICK_MAX_POLLS         = 60
+CLICK_BETWEEN_CAMPAIGNS = 30
+CLICK_429_MAX_RETRIES   = 5
+CLICK_429_MAX_WAIT      = 120
+MAX_PAGES_PER_CHUNK     = 200
 
 # ==========================================================
-# SYNC STATE — prevent concurrent runs and expose status
+# SIGNAL HANDLING
+#
+# Render sends SIGTERM periodically as a health/cycle event.
+# It does NOT mean "shut down" — so _handle_sigterm just logs
+# and returns. The process keeps running.
+# Only SIGINT (kill -INT / Ctrl-C) triggers a real stop.
+# ==========================================================
+_hard_stop     = threading.Event()   # set only by SIGINT
+_sigterm_count = 0
+
+def _handle_sigterm(signum, frame):
+    global _sigterm_count
+    _sigterm_count += 1
+    log.warning(
+        f"⚠️  SIGTERM #{_sigterm_count} received — Render is cycling the service. "
+        "Ignoring and continuing to run. (Send SIGINT for a real stop.)"
+    )
+    # Intentionally do NOT set _hard_stop
+
+def _handle_sigint(signum, frame):
+    log.info("SIGINT received. Will stop after current sync completes.")
+    _hard_stop.set()
+
+signal.signal(signal.SIGTERM, _handle_sigterm)
+signal.signal(signal.SIGINT,  _handle_sigint)
+
+# ==========================================================
+# SYNC STATE
 # ==========================================================
 _sync_lock   = threading.Lock()
 _sync_status = {
-    "running":    False,
-    "last_start": None,
-    "last_end":   None,
-    "last_error": None,
+    "running":     False,
+    "last_start":  None,
+    "last_end":    None,
+    "last_error":  None,
     "rows_synced": 0,
+    "sigterm_count": 0,
 }
-
-# ==========================================================
-# GRACEFUL SHUTDOWN
-# ==========================================================
-_shutdown_event = threading.Event()
-
-def _handle_signal(signum, frame):
-    log.info(f"Received signal {signum}. Setting shutdown flag.")
-    _shutdown_event.set()
-
-signal.signal(signal.SIGTERM, _handle_signal)
-signal.signal(signal.SIGINT,  _handle_signal)
 
 # ==========================================================
 # FLASK APP
@@ -100,66 +113,57 @@ def index():
 
 @app.route("/health")
 def health():
-    missing = []
-    if not ACCOUNT_SID:  missing.append("IMPACT_ACCOUNT_SID")
-    if not AUTH_TOKEN:   missing.append("IMPACT_AUTH_TOKEN")
-    if not SPREADSHEET_ID: missing.append("SPREADSHEET_ID")
-
+    missing = [v for v in ["IMPACT_ACCOUNT_SID", "IMPACT_AUTH_TOKEN", "SPREADSHEET_ID"]
+               if not os.getenv(v)]
     if missing:
         return jsonify({"status": "unhealthy", "missing_env": missing}), 500
-
     status = dict(_sync_status)
-    status["status"] = "healthy"
+    status["status"]        = "healthy"
+    status["sigterm_count"] = _sigterm_count
     return jsonify(status), 200
+
+@app.route("/status")
+def sync_status_route():
+    s = dict(_sync_status)
+    s["sigterm_count"] = _sigterm_count
+    return jsonify(s)
 
 @app.route("/trigger", methods=["POST"])
 def trigger_sync():
     if _sync_status["running"]:
-        return jsonify({"status": "already_running", "message": "A sync is already in progress."}), 409
-
+        return jsonify({"status": "already_running"}), 409
     full_refresh = request.args.get("full", "false").lower() == "true"
     skip_clicks  = request.args.get("skip_clicks", "false").lower() == "true"
-
-    thread = threading.Thread(
-        target=_run_sync_safe, args=(full_refresh, skip_clicks), daemon=True
-    )
-    thread.start()
+    threading.Thread(target=_run_sync_safe, args=(full_refresh, skip_clicks), daemon=True).start()
     return jsonify({"status": "sync started", "full_refresh": full_refresh, "skip_clicks": skip_clicks}), 202
 
 @app.route("/trigger/full", methods=["POST"])
 def trigger_full_sync():
     if _sync_status["running"]:
         return jsonify({"status": "already_running"}), 409
-
-    thread = threading.Thread(target=_run_sync_safe, args=(True, False), daemon=True)
-    thread.start()
+    threading.Thread(target=_run_sync_safe, args=(True, False), daemon=True).start()
     return jsonify({"status": "full sync started"}), 202
 
-@app.route("/status")
-def sync_status():
-    return jsonify(dict(_sync_status))
-
 # ==========================================================
-# SYNC RUNNER — wraps main() with state tracking
+# SYNC RUNNER
 # ==========================================================
 def _run_sync_safe(full_refresh: bool = False, skip_clicks: bool = False):
-    """Thread-safe wrapper around main(). Updates _sync_status."""
     if not _sync_lock.acquire(blocking=False):
-        log.warning("Sync already running — skipping this trigger.")
+        log.warning("Sync already running — skipping.")
         return
 
     _sync_status["running"]    = True
-    _sync_status["last_start"] = datetime.utcnow().isoformat()
+    _sync_status["last_start"] = datetime.now(timezone.utc).isoformat()
     _sync_status["last_error"] = None
 
     try:
         rows = main(full_refresh=full_refresh, skip_clicks=skip_clicks)
         _sync_status["rows_synced"] = rows
-        _sync_status["last_end"]    = datetime.utcnow().isoformat()
+        _sync_status["last_end"]    = datetime.now(timezone.utc).isoformat()
         log.info(f"✅ Sync completed. Rows synced: {rows}")
     except Exception as e:
         _sync_status["last_error"] = str(e)
-        _sync_status["last_end"]   = datetime.utcnow().isoformat()
+        _sync_status["last_end"]   = datetime.now(timezone.utc).isoformat()
         log.error(f"❌ Sync failed: {e}", exc_info=True)
     finally:
         _sync_status["running"] = False
@@ -172,35 +176,24 @@ def get_google_creds():
     b64 = os.getenv("GOOGLE_CREDENTIALS_JSON")
     if b64:
         try:
-            # Support both raw JSON and base64-encoded JSON
             try:
                 creds_json = json.loads(b64)
             except json.JSONDecodeError:
                 creds_json = json.loads(base64.b64decode(b64))
             return service_account.Credentials.from_service_account_info(
-                creds_json,
-                scopes=["https://www.googleapis.com/auth/spreadsheets"],
+                creds_json, scopes=["https://www.googleapis.com/auth/spreadsheets"]
             )
         except Exception as e:
             raise RuntimeError(f"Failed to parse GOOGLE_CREDENTIALS_JSON: {e}") from e
-
     if os.path.exists("credentials.json"):
         return service_account.Credentials.from_service_account_file(
-            "credentials.json",
-            scopes=["https://www.googleapis.com/auth/spreadsheets"],
+            "credentials.json", scopes=["https://www.googleapis.com/auth/spreadsheets"]
         )
-
-    raise RuntimeError(
-        "No Google credentials found. Set GOOGLE_CREDENTIALS_JSON env var "
-        "or provide credentials.json."
-    )
+    raise RuntimeError("No Google credentials found.")
 
 def get_sheets_service():
     return build("sheets", "v4", credentials=get_google_creds())
 
-# ==========================================================
-# DATE HELPERS
-# ==========================================================
 def parse_iso_date(iso_str: str) -> str:
     try:
         return iso_str.split("T")[0] if "T" in iso_str else iso_str
@@ -208,7 +201,6 @@ def parse_iso_date(iso_str: str) -> str:
         return iso_str
 
 def get_last_synced_date(service):
-    """Read Sheet1 column A to find the most recent date already synced."""
     try:
         result = service.spreadsheets().values().get(
             spreadsheetId=SPREADSHEET_ID,
@@ -217,7 +209,6 @@ def get_last_synced_date(service):
         values = result.get("values", [])
         if len(values) <= 1:
             return None
-
         latest = None
         for row in values[1:]:
             if row and row[0]:
@@ -233,8 +224,7 @@ def get_last_synced_date(service):
         return None
 
 def get_date_chunks(start_date, end_date):
-    chunks = []
-    cur = start_date
+    chunks, cur = [], start_date
     while cur < end_date:
         nxt = min(cur + timedelta(days=CHUNK_DAYS), end_date)
         chunks.append((
@@ -245,28 +235,23 @@ def get_date_chunks(start_date, end_date):
     return chunks
 
 # ==========================================================
-# HTTP HELPER — retries with exponential back-off
+# HTTP HELPER
 # ==========================================================
 def _get_with_retry(url, params=None, max_attempts=5, timeout=60, label="request"):
-    """
-    GET with retry on 429 / transient errors.
-    Returns (response | None). Never raises.
-    """
     for attempt in range(1, max_attempts + 1):
-        if _shutdown_event.is_set():
-            log.info("Shutdown requested — aborting HTTP request.")
+        # Only check _hard_stop, not SIGTERM — we never stop on SIGTERM
+        if _hard_stop.is_set():
+            log.info("Hard stop — aborting HTTP request.")
             return None
         try:
-            resp = requests.get(
-                url, params=params, auth=AUTH,
-                headers={"Accept": "application/json"}, timeout=timeout,
-            )
+            resp = requests.get(url, params=params, auth=AUTH,
+                                headers={"Accept": "application/json"}, timeout=timeout)
             if resp.status_code == 200:
                 return resp
             if resp.status_code == 429:
                 retry_after = resp.headers.get("Retry-After")
                 wait = min(int(retry_after) if retry_after else 60 * attempt, 300)
-                log.warning(f"[{label}] 429 rate limited. Waiting {wait}s (attempt {attempt}/{max_attempts})...")
+                log.warning(f"[{label}] 429. Waiting {wait}s (attempt {attempt}/{max_attempts})...")
                 time.sleep(wait)
                 continue
             log.warning(f"[{label}] HTTP {resp.status_code}: {resp.text[:200]}")
@@ -276,7 +261,6 @@ def _get_with_retry(url, params=None, max_attempts=5, timeout=60, label="request
         except Exception as e:
             log.warning(f"[{label}] Exception (attempt {attempt}/{max_attempts}): {e}")
         time.sleep(2 ** attempt)
-
     log.error(f"[{label}] All {max_attempts} attempts failed.")
     return None
 
@@ -285,112 +269,77 @@ def _get_with_retry(url, params=None, max_attempts=5, timeout=60, label="request
 # ==========================================================
 def fetch_campaigns():
     log.info("Fetching campaign list...")
-    resp = _get_with_retry(
-        f"{IMPACT_BASE_URL}/Advertisers/{ACCOUNT_SID}/Campaigns",
-        label="campaigns",
-    )
+    resp = _get_with_retry(f"{IMPACT_BASE_URL}/Advertisers/{ACCOUNT_SID}/Campaigns", label="campaigns")
     if not resp:
         return []
-
     data = resp.json()
     campaigns = data.get("Campaigns", []) or data.get("Records", [])
     log.info(f"Found {len(campaigns)} campaigns.")
     return campaigns
 
 # ==========================================================
-# FETCH ACTIONS (Conversions) — Chunked + page-capped
+# FETCH ACTIONS
 # ==========================================================
 def fetch_actions(campaigns, date_chunks):
     log.info(f"Fetching Actions in {len(date_chunks)} chunk(s)...")
     actions_data = defaultdict(lambda: {"actions": 0, "revenue": 0.0, "cost": 0.0})
 
     for campaign in campaigns:
-        if _shutdown_event.is_set():
-            log.info("Shutdown — stopping actions fetch early.")
+        if _hard_stop.is_set():
             break
-
-        campaign_id   = campaign.get("Id")
-        campaign_name = campaign.get("Name")
+        campaign_id, campaign_name = campaign.get("Id"), campaign.get("Name")
         log.info(f"  Actions: {campaign_name} ({campaign_id})")
 
         for chunk_start, chunk_end in date_chunks:
-            if _shutdown_event.is_set():
+            if _hard_stop.is_set():
                 break
-
             page = 1
             while page <= MAX_PAGES_PER_CHUNK:
-                if _shutdown_event.is_set():
+                if _hard_stop.is_set():
                     break
-
                 resp = _get_with_retry(
                     f"{IMPACT_BASE_URL}/Advertisers/{ACCOUNT_SID}/Actions",
-                    params={
-                        "CampaignId": campaign_id,
-                        "ActionDateStart": chunk_start,
-                        "ActionDateEnd": chunk_end,
-                        "Page": page,
-                        "PageSize": PAGE_SIZE,
-                        "Format": "JSON",
-                    },
+                    params={"CampaignId": campaign_id, "ActionDateStart": chunk_start,
+                            "ActionDateEnd": chunk_end, "Page": page,
+                            "PageSize": PAGE_SIZE, "Format": "JSON"},
                     label=f"actions/{campaign_id}/p{page}",
                 )
-
                 if not resp:
                     break
-
                 data    = resp.json()
                 actions = data.get("Actions", []) or data.get("Records", [])
                 if not actions:
                     break
-
                 for action in actions:
-                    date_str     = parse_iso_date(action.get("EventDate", ""))
-                    partner_name = action.get("MediaPartnerName", "Unknown")
-                    revenue      = float(action.get("Amount", 0) or 0)
-                    payout       = float(action.get("Payout", 0) or 0)
-
-                    key = (date_str, campaign_name, partner_name)
+                    key = (parse_iso_date(action.get("EventDate", "")),
+                           campaign_name, action.get("MediaPartnerName", "Unknown"))
                     actions_data[key]["actions"] += 1
-                    actions_data[key]["revenue"] += revenue
-                    actions_data[key]["cost"]    += payout
-
+                    actions_data[key]["revenue"] += float(action.get("Amount", 0) or 0)
+                    actions_data[key]["cost"]    += float(action.get("Payout", 0) or 0)
                 if not data.get("@nextpageuri") or len(actions) < PAGE_SIZE:
                     break
-
                 page += 1
                 time.sleep(RATE_LIMIT_DELAY)
-
             if page > MAX_PAGES_PER_CHUNK:
-                log.warning(f"  Hit MAX_PAGES_PER_CHUNK ({MAX_PAGES_PER_CHUNK}) for {campaign_name}. Some data may be missing.")
-
+                log.warning(f"  Hit MAX_PAGES_PER_CHUNK for {campaign_name}.")
     return actions_data
 
 # ==========================================================
-# FETCH CLICKS (Async ClickExport)
+# FETCH CLICKS
 # ==========================================================
 def submit_click_job(campaign_id, start_date, end_date):
     url = f"{IMPACT_BASE_URL}/Advertisers/{ACCOUNT_SID}/Programs/{campaign_id}/ClickExport"
-
-    for retry in range(CLICK_429_MAX_RETRIES):
-        if _shutdown_event.is_set():
+    for _ in range(CLICK_429_MAX_RETRIES):
+        if _hard_stop.is_set():
             return None
-
-        resp = _get_with_retry(
-            url,
-            params={"DateStart": start_date, "DateEnd": end_date},
-            max_attempts=1,           # _get_with_retry handles 429 internally
-            label=f"click_submit/{campaign_id}",
-        )
+        resp = _get_with_retry(url, params={"DateStart": start_date, "DateEnd": end_date},
+                               max_attempts=1, label=f"click_submit/{campaign_id}")
         if resp:
             queued_uri = resp.json().get("QueuedUri", "")
             if "/Jobs/" in queued_uri:
                 return queued_uri.split("/Jobs/")[1].split("/")[0]
             return None
-
-        # If _get_with_retry already exhausted its attempts, give up
-        log.warning(f"  submit_click_job failed after retries for {campaign_id}.")
         return "RATE_LIMITED"
-
     return None
 
 def fetch_clicks(campaigns, start_date, end_date):
@@ -398,19 +347,15 @@ def fetch_clicks(campaigns, start_date, end_date):
     clicks_data = defaultdict(lambda: {"clicks": 0})
 
     for i, campaign in enumerate(campaigns):
-        if _shutdown_event.is_set():
-            log.info("Shutdown — stopping clicks fetch early.")
+        if _hard_stop.is_set():
             break
-
-        campaign_id   = campaign.get("Id")
-        campaign_name = campaign.get("Name")
+        campaign_id, campaign_name = campaign.get("Id"), campaign.get("Name")
         log.info(f"  Clicks [{i+1}/{len(campaigns)}]: {campaign_name}")
 
         if i > 0:
-            log.info(f"  Waiting {CLICK_BETWEEN_CAMPAIGNS}s between campaigns...")
-            # Interruptible sleep
+            log.info(f"  Waiting {CLICK_BETWEEN_CAMPAIGNS}s...")
             for _ in range(CLICK_BETWEEN_CAMPAIGNS):
-                if _shutdown_event.is_set():
+                if _hard_stop.is_set():
                     break
                 time.sleep(1)
 
@@ -420,22 +365,19 @@ def fetch_clicks(campaigns, start_date, end_date):
                 log.warning("ClickExport rate-limited. Skipping remaining campaigns.")
                 break
             if not job_id:
-                log.warning(f"  No job ID returned for {campaign_name}. Skipping.")
+                log.warning(f"  No job ID for {campaign_name}. Skipping.")
                 continue
 
             log.info(f"  Job ID: {job_id}")
-            job_url = f"{IMPACT_BASE_URL}/Advertisers/{ACCOUNT_SID}/Jobs/{job_id}"
-            completed = False
+            job_url, completed = f"{IMPACT_BASE_URL}/Advertisers/{ACCOUNT_SID}/Jobs/{job_id}", False
 
             for poll in range(CLICK_MAX_POLLS):
-                if _shutdown_event.is_set():
+                if _hard_stop.is_set():
                     break
                 time.sleep(CLICK_POLL_INTERVAL)
-
                 resp = _get_with_retry(job_url, label=f"job_poll/{job_id}")
                 if not resp:
                     continue
-
                 status = resp.json().get("Status", "UNKNOWN")
                 log.info(f"  Poll {poll+1}: {status}")
                 if status == "COMPLETED":
@@ -446,23 +388,22 @@ def fetch_clicks(campaigns, start_date, end_date):
                     break
 
             if not completed:
-                log.warning(f"  Job did not complete in time for {campaign_name}. Skipping.")
+                log.warning(f"  Job timed out for {campaign_name}. Skipping.")
                 continue
 
-            download_url = f"{IMPACT_BASE_URL}/Advertisers/{ACCOUNT_SID}/Jobs/{job_id}/Download"
-            dl_resp = requests.get(download_url, auth=AUTH, timeout=120)
+            dl_resp = requests.get(
+                f"{IMPACT_BASE_URL}/Advertisers/{ACCOUNT_SID}/Jobs/{job_id}/Download",
+                auth=AUTH, timeout=120
+            )
             if dl_resp.status_code != 200:
                 log.warning(f"  Download failed: {dl_resp.status_code}")
                 continue
 
-            reader = csv.DictReader(io.StringIO(dl_resp.text))
-            rows = list(reader)
+            rows = list(csv.DictReader(io.StringIO(dl_resp.text)))
             log.info(f"  {len(rows)} click rows downloaded.")
-
             for row in rows:
-                date_str     = parse_iso_date(row.get("EventDate", ""))
-                partner_name = row.get("MediaName", "Unknown")
-                key = (date_str, campaign_name, partner_name)
+                key = (parse_iso_date(row.get("EventDate", "")),
+                       campaign_name, row.get("MediaName", "Unknown"))
                 clicks_data[key]["clicks"] += 1
 
         except Exception as e:
@@ -472,25 +413,22 @@ def fetch_clicks(campaigns, start_date, end_date):
     return clicks_data
 
 # ==========================================================
-# MERGE DATA
+# MERGE
 # ==========================================================
 def merge_data(actions_data, clicks_data):
-    all_keys  = set(actions_data.keys()) | set(clicks_data.keys())
-    rows      = []
+    all_keys   = set(actions_data.keys()) | set(clicks_data.keys())
+    rows       = []
     brand_rows = defaultdict(list)
 
     for key in sorted(all_keys, key=lambda x: x[0], reverse=True):
         date_str, campaign_name, partner_name = key
-        a = actions_data.get(key, {"actions": 0, "revenue": 0.0, "cost": 0.0})
-        c = clicks_data.get(key, {"clicks": 0})
-
-        actions     = a["actions"]
-        revenue     = round(a["revenue"], 2)
-        total_cost  = round(a["cost"], 2)
-        clicks      = c["clicks"]
-        cpc         = round(total_cost / clicks, 2) if clicks > 0 else 0.0
-
-        row = [date_str, campaign_name, partner_name, clicks, actions, revenue, total_cost, total_cost, cpc]
+        a          = actions_data.get(key, {"actions": 0, "revenue": 0.0, "cost": 0.0})
+        c          = clicks_data.get(key, {"clicks": 0})
+        total_cost = round(a["cost"], 2)
+        clicks     = c["clicks"]
+        row = [date_str, campaign_name, partner_name, clicks,
+               a["actions"], round(a["revenue"], 2), total_cost, total_cost,
+               round(total_cost / clicks, 2) if clicks > 0 else 0.0]
         rows.append(row)
         brand_rows[campaign_name.replace(":", "").replace("/", "-")[:30]].append(row)
 
@@ -498,24 +436,19 @@ def merge_data(actions_data, clicks_data):
     return rows, brand_rows
 
 # ==========================================================
-# GOOGLE SHEETS WRITE — safe & retried
+# SHEETS WRITE
 # ==========================================================
 def _sheets_call_with_retry(call_fn, label="sheets", max_attempts=4):
-    """Execute a Google Sheets API call with exponential back-off."""
     for attempt in range(1, max_attempts + 1):
         try:
             return call_fn()
         except Exception as e:
             err = str(e)
-            if "quota" in err.lower() or "rate" in err.lower():
-                wait = 30 * attempt
-                log.warning(f"[{label}] Quota/rate error (attempt {attempt}). Waiting {wait}s...")
-                time.sleep(wait)
-            else:
-                log.error(f"[{label}] Sheets error (attempt {attempt}): {e}")
-                if attempt == max_attempts:
-                    raise
-                time.sleep(5 * attempt)
+            wait = 30 * attempt if ("quota" in err.lower() or "rate" in err.lower()) else 5 * attempt
+            log.warning(f"[{label}] Error attempt {attempt}: {e}. Waiting {wait}s...")
+            if attempt == max_attempts:
+                raise
+            time.sleep(wait)
     raise RuntimeError(f"[{label}] Failed after {max_attempts} attempts.")
 
 def ensure_sheet_exists(service, sheet_title):
@@ -523,7 +456,6 @@ def ensure_sheet_exists(service, sheet_title):
         metadata = service.spreadsheets().get(spreadsheetId=SPREADSHEET_ID).execute()
         existing = [s["properties"]["title"] for s in metadata.get("sheets", [])]
         if sheet_title not in existing:
-            log.info(f"Creating sheet: {sheet_title}")
             service.spreadsheets().batchUpdate(
                 spreadsheetId=SPREADSHEET_ID,
                 body={"requests": [{"addSheet": {"properties": {"title": sheet_title}}}]},
@@ -537,106 +469,75 @@ def ensure_sheet_exists(service, sheet_title):
 def sheet_has_data(service, sheet_title):
     try:
         result = service.spreadsheets().values().get(
-            spreadsheetId=SPREADSHEET_ID,
-            range=f"'{sheet_title}'!A1",
+            spreadsheetId=SPREADSHEET_ID, range=f"'{sheet_title}'!A1"
         ).execute()
         return bool(result.get("values"))
     except Exception:
         return False
 
 def clear_all_sheets(service):
-    """
-    Delete all non-Sheet1 sheets, then clear Sheet1.
-    Runs inside a try/except so a partial failure doesn't abort the sync.
-    """
-    log.info("Clearing all existing sheets for full refresh...")
+    log.info("Clearing all sheets for full refresh...")
     try:
         metadata = service.spreadsheets().get(spreadsheetId=SPREADSHEET_ID).execute()
-        sheets   = metadata.get("sheets", [])
-
-        delete_requests = [
-            {"deleteSheet": {"sheetId": s["properties"]["sheetId"]}}
-            for s in sheets
-            if s["properties"]["title"] != SHEET_MAIN_AGGREGATE
-        ]
-
-        if delete_requests:
+        deletes  = [{"deleteSheet": {"sheetId": s["properties"]["sheetId"]}}
+                    for s in metadata.get("sheets", [])
+                    if s["properties"]["title"] != SHEET_MAIN_AGGREGATE]
+        if deletes:
             service.spreadsheets().batchUpdate(
-                spreadsheetId=SPREADSHEET_ID,
-                body={"requests": delete_requests},
+                spreadsheetId=SPREADSHEET_ID, body={"requests": deletes}
             ).execute()
-
         service.spreadsheets().values().clear(
-            spreadsheetId=SPREADSHEET_ID,
-            range=f"'{SHEET_MAIN_AGGREGATE}'!A:Z",
+            spreadsheetId=SPREADSHEET_ID, range=f"'{SHEET_MAIN_AGGREGATE}'!A:Z"
         ).execute()
         log.info("All sheets cleared.")
     except Exception as e:
-        log.error(f"clear_all_sheets error: {e}. Proceeding without clearing.")
+        log.error(f"clear_all_sheets error: {e}. Proceeding anyway.")
 
 def sync_to_sheets(master_rows, brand_rows, full_refresh):
     service = get_sheets_service()
     svc     = service.spreadsheets()
-
-    header = [["DATE", "CAMPAIGN", "PARTNER", "CLICKS",
-               "ACTIONS", "REVENUE USD", "ACTIONS COST USD", "TOTAL COST USD", "CPC USD"]]
+    header  = [["DATE", "CAMPAIGN", "PARTNER", "CLICKS",
+                "ACTIONS", "REVENUE USD", "ACTIONS COST USD", "TOTAL COST USD", "CPC USD"]]
 
     if full_refresh:
         clear_all_sheets(service)
 
     log.info(f"Syncing {len(master_rows)} rows to '{SHEET_MAIN_AGGREGATE}'...")
-
     if full_refresh or not sheet_has_data(service, SHEET_MAIN_AGGREGATE):
         _sheets_call_with_retry(lambda: svc.values().update(
-            spreadsheetId=SPREADSHEET_ID,
-            range=f"'{SHEET_MAIN_AGGREGATE}'!A1",
-            valueInputOption="RAW",
-            body={"values": header + master_rows},
+            spreadsheetId=SPREADSHEET_ID, range=f"'{SHEET_MAIN_AGGREGATE}'!A1",
+            valueInputOption="RAW", body={"values": header + master_rows}
         ).execute(), label=SHEET_MAIN_AGGREGATE)
     else:
         _sheets_call_with_retry(lambda: svc.values().append(
-            spreadsheetId=SPREADSHEET_ID,
-            range=f"'{SHEET_MAIN_AGGREGATE}'!A:I",
-            valueInputOption="RAW",
-            insertDataOption="INSERT_ROWS",
-            body={"values": master_rows},
+            spreadsheetId=SPREADSHEET_ID, range=f"'{SHEET_MAIN_AGGREGATE}'!A:I",
+            valueInputOption="RAW", insertDataOption="INSERT_ROWS",
+            body={"values": master_rows}
         ).execute(), label=SHEET_MAIN_AGGREGATE)
 
     for sheet_name, data_rows in brand_rows.items():
-        if _shutdown_event.is_set():
-            log.info("Shutdown — stopping brand sheet writes.")
+        if _hard_stop.is_set():
+            log.info("Hard stop — stopping brand sheet writes.")
             break
-
         log.info(f"  Writing '{sheet_name}': {len(data_rows)} rows")
         is_new = ensure_sheet_exists(service, sheet_name)
-
         if full_refresh or is_new:
             _sheets_call_with_retry(lambda sn=sheet_name, dr=data_rows: svc.values().update(
-                spreadsheetId=SPREADSHEET_ID,
-                range=f"'{sn}'!A1",
-                valueInputOption="RAW",
-                body={"values": header + dr},
+                spreadsheetId=SPREADSHEET_ID, range=f"'{sn}'!A1",
+                valueInputOption="RAW", body={"values": header + dr}
             ).execute(), label=sheet_name)
         else:
             _sheets_call_with_retry(lambda sn=sheet_name, dr=data_rows: svc.values().append(
-                spreadsheetId=SPREADSHEET_ID,
-                range=f"'{sn}'!A:I",
-                valueInputOption="RAW",
-                insertDataOption="INSERT_ROWS",
-                body={"values": dr},
+                spreadsheetId=SPREADSHEET_ID, range=f"'{sn}'!A:I",
+                valueInputOption="RAW", insertDataOption="INSERT_ROWS",
+                body={"values": dr}
             ).execute(), label=sheet_name)
 
 # ==========================================================
-# MAIN SYNC LOGIC
+# MAIN SYNC
 # ==========================================================
 def main(full_refresh: bool = False, skip_clicks: bool = False) -> int:
-    """
-    Runs one full sync cycle.
-    Args come from callers only — sys.argv is never read here.
-    Returns the number of rows synced.
-    """
     log.info(f"Impact Data Sync | mode={'FULL' if full_refresh else 'INCREMENTAL'} | skip_clicks={skip_clicks}")
-
     if not AUTH:
         raise RuntimeError("Cannot sync: missing IMPACT_ACCOUNT_SID or IMPACT_AUTH_TOKEN.")
 
@@ -644,45 +545,33 @@ def main(full_refresh: bool = False, skip_clicks: bool = False) -> int:
 
     if full_refresh:
         start_date = (datetime.today() - timedelta(days=1095)).date()
-        log.info(f"Full refresh from: {start_date}")
     else:
         last_date = get_last_synced_date(service)
         if last_date:
             start_date = last_date
-            log.info(f"Incremental from last synced date: {start_date}")
+            log.info(f"Incremental from: {start_date}")
         else:
-            # No existing data — do a full refresh but DON'T silently flip the flag
-            start_date = (datetime.today() - timedelta(days=1095)).date()
+            start_date   = (datetime.today() - timedelta(days=1095)).date()
             full_refresh = True
-            log.info(f"No existing data found. Starting full refresh from: {start_date}")
+            log.info(f"No existing data. Full refresh from: {start_date}")
 
     end_date = datetime.today().date()
-
     if start_date >= end_date:
-        log.info("Already up to date. Nothing to sync.")
+        log.info("Already up to date.")
         return 0
 
     log.info(f"Date range: {start_date} → {end_date}")
-
     campaigns = fetch_campaigns()
     if not campaigns:
-        raise RuntimeError("No campaigns returned from Impact API. Aborting.")
+        raise RuntimeError("No campaigns returned from Impact API.")
 
     date_chunks  = get_date_chunks(start_date, end_date)
     actions_data = fetch_actions(campaigns, date_chunks)
-
-    if skip_clicks:
-        log.info("Skipping clicks (skip_clicks=True).")
-        clicks_data = {}
-    else:
-        clicks_data = fetch_clicks(
-            campaigns,
-            start_date.strftime("%Y-%m-%d"),
-            end_date.strftime("%Y-%m-%d"),
-        )
+    clicks_data  = {} if skip_clicks else fetch_clicks(
+        campaigns, start_date.strftime("%Y-%m-%d"), end_date.strftime("%Y-%m-%d")
+    )
 
     master_rows, brand_rows = merge_data(actions_data, clicks_data)
-
     if not master_rows:
         log.info("No new data to sync.")
         return 0
@@ -695,33 +584,27 @@ def main(full_refresh: bool = False, skip_clicks: bool = False) -> int:
 # ENTRY POINT
 # ==========================================================
 if __name__ == "__main__":
-    # Parse CLI args here — never inside main()
     cli_full_refresh = "--full"        in sys.argv
     cli_skip_clicks  = "--skip-clicks" in sys.argv
     cli_no_server    = "--no-server"   in sys.argv
 
     if cli_no_server:
-        # Useful for one-off manual runs (e.g. local testing)
-        log.info("Running in CLI mode (no Flask server).")
+        log.info("CLI mode — no Flask server.")
         try:
-            rows = main(full_refresh=cli_full_refresh, skip_clicks=cli_skip_clicks)
-            sys.exit(0 if rows >= 0 else 1)
+            sys.exit(0 if main(full_refresh=cli_full_refresh, skip_clicks=cli_skip_clicks) >= 0 else 1)
         except Exception as e:
             log.error(f"Sync failed: {e}", exc_info=True)
             sys.exit(1)
 
-    # Start initial sync in background BEFORE Flask binds the port.
-    # This way Render's health check passes immediately.
-    init_thread = threading.Thread(
-        target=_run_sync_safe,
-        args=(cli_full_refresh, cli_skip_clicks),
-        daemon=True,
-    )
-    init_thread.start()
+    # Fire initial sync in background so Flask binds the port immediately
+    threading.Thread(
+        target=_run_sync_safe, args=(cli_full_refresh, cli_skip_clicks), daemon=True
+    ).start()
 
     port = int(os.environ.get("PORT", 10000))
     log.info(f"Starting Flask on 0.0.0.0:{port}")
+    log.info("ℹ️  SIGTERM is ignored — process keeps running through Render cycles.")
+    log.info("ℹ️  Send SIGINT for a real stop.")
 
-    # use_reloader=False is critical — reloader forks the process and
-    # double-starts the sync thread, causing data corruption on Render.
+    # use_reloader=False prevents Flask from forking and double-starting the sync thread
     app.run(host="0.0.0.0", port=port, use_reloader=False, threaded=True)
