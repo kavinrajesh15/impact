@@ -5,7 +5,7 @@ import time
 import csv
 import io
 import base64
-import signal  
+import signal
 import logging
 import requests
 import threading
@@ -44,7 +44,7 @@ def _require_env(name: str) -> str:
 
 ACCOUNT_SID    = _require_env("IMPACT_ACCOUNT_SID")
 AUTH_TOKEN     = _require_env("IMPACT_AUTH_TOKEN")
-SPREADSHEET_ID = os.getenv("SPREADSHEET_ID", "")
+SPREADSHEET_ID = os.getenv("SPREADSHEET_ID", "1sAc23AM5vdCfKOCxwI-vbM0lCdk8zRDW-iGbB_wkhM0")
 AUTH           = HTTPBasicAuth(ACCOUNT_SID, AUTH_TOKEN) if ACCOUNT_SID and AUTH_TOKEN else None
 
 # ==========================================================
@@ -329,18 +329,14 @@ def fetch_actions(campaigns, date_chunks):
 # ==========================================================
 def submit_click_job(campaign_id, start_date, end_date):
     url = f"{IMPACT_BASE_URL}/Advertisers/{ACCOUNT_SID}/Programs/{campaign_id}/ClickExport"
-    for _ in range(CLICK_429_MAX_RETRIES):
-        if _hard_stop.is_set():
-            return None
-        resp = _get_with_retry(url, params={"DateStart": start_date, "DateEnd": end_date},
-                               max_attempts=1, label=f"click_submit/{campaign_id}")
-        if resp:
-            queued_uri = resp.json().get("QueuedUri", "")
-            if "/Jobs/" in queued_uri:
-                return queued_uri.split("/Jobs/")[1].split("/")[0]
-            return None
-        return "RATE_LIMITED"
-    return None
+    resp = _get_with_retry(url, params={"DateStart": start_date, "DateEnd": end_date},
+                           max_attempts=CLICK_429_MAX_RETRIES, label=f"click_submit/{campaign_id}")
+    if resp:
+        queued_uri = resp.json().get("QueuedUri", "")
+        if "/Jobs/" in queued_uri:
+            return queued_uri.split("/Jobs/")[1].split("/")[0]
+        return None
+    return "RATE_LIMITED"
 
 def fetch_clicks(campaigns, start_date, end_date):
     log.info("Fetching Clicks via ClickExport...")
@@ -362,8 +358,8 @@ def fetch_clicks(campaigns, start_date, end_date):
         try:
             job_id = submit_click_job(campaign_id, start_date, end_date)
             if job_id == "RATE_LIMITED":
-                log.warning("ClickExport rate-limited. Skipping remaining campaigns.")
-                break
+                log.warning(f"ClickExport rate-limited for {campaign_name}. Skipping to next campaign.")
+                continue
             if not job_id:
                 log.warning(f"  No job ID for {campaign_name}. Skipping.")
                 continue
@@ -537,23 +533,17 @@ def sync_to_sheets(master_rows, brand_rows, full_refresh):
 # MAIN SYNC
 # ==========================================================
 def main(full_refresh: bool = False, skip_clicks: bool = False) -> int:
+    # Always clear sheets and pull last 1 year of data
+    full_refresh = True
+    
     log.info(f"Impact Data Sync | mode={'FULL' if full_refresh else 'INCREMENTAL'} | skip_clicks={skip_clicks}")
     if not AUTH:
         raise RuntimeError("Cannot sync: missing IMPACT_ACCOUNT_SID or IMPACT_AUTH_TOKEN.")
 
     service = get_sheets_service()
 
-    if full_refresh:
-        start_date = (datetime.today() - timedelta(days=1095)).date()
-    else:
-        last_date = get_last_synced_date(service)
-        if last_date:
-            start_date = last_date
-            log.info(f"Incremental from: {start_date}")
-        else:
-            start_date   = (datetime.today() - timedelta(days=1095)).date()
-            full_refresh = True
-            log.info(f"No existing data. Full refresh from: {start_date}")
+    start_date = (datetime.today() - timedelta(days=365)).date()
+    log.info(f"Full refresh forced. Fetching 1 year of data from: {start_date}")
 
     end_date = datetime.today().date()
     if start_date >= end_date:
@@ -581,30 +571,73 @@ def main(full_refresh: bool = False, skip_clicks: bool = False) -> int:
     return len(master_rows)
 
 # ==========================================================
+# WEEKLY SCHEDULER
+# ==========================================================
+def get_seconds_until_next_monday_12am():
+    """Calculate the exact seconds to wait until next Monday at 12:00 AM (midnight) local time."""
+    now = datetime.now()
+    days_ahead = (0 - now.weekday()) % 7
+    target = now.replace(hour=0, minute=0, second=0, microsecond=0) + timedelta(days=days_ahead)
+    if target <= now:
+        target += timedelta(days=7)
+    
+    return (target - now).total_seconds()
+
+def run_scheduler():
+    log.info("⏰ Scheduler thread started.")
+    while True:
+        seconds_to_wait = get_seconds_until_next_monday_12am()
+        next_run = datetime.now() + timedelta(seconds=seconds_to_wait)
+        log.info(f"⏰ Next sync scheduled for Monday 12:00 AM (local time): {next_run.strftime('%Y-%m-%d %H:%M:%S')} (in {seconds_to_wait:.1f} seconds)")
+        
+        while seconds_to_wait > 0:
+            if _hard_stop.is_set():
+                log.info("Hard stop received — stopping scheduler.")
+                return
+            sleep_chunk = min(seconds_to_wait, 3600)
+            time.sleep(sleep_chunk)
+            seconds_to_wait -= sleep_chunk
+            
+        log.info("⏰ Scheduler triggered! Running sync...")
+        try:
+            # Scheduled runs run safe under the thread lock, with incremental/default modes
+            _run_sync_safe(full_refresh=False, skip_clicks=False)
+        except Exception as e:
+            log.error(f"⏰ Scheduled sync failed: {e}", exc_info=True)
+
+# ==========================================================
 # ENTRY POINT
 # ==========================================================
 if __name__ == "__main__":
     cli_full_refresh = "--full"        in sys.argv
     cli_skip_clicks  = "--skip-clicks" in sys.argv
     cli_no_server    = "--no-server"   in sys.argv
+    cli_scheduler    = "--scheduler"   in sys.argv
 
     if cli_no_server:
-        log.info("CLI mode — no Flask server.")
-        try:
-            sys.exit(0 if main(full_refresh=cli_full_refresh, skip_clicks=cli_skip_clicks) >= 0 else 1)
-        except Exception as e:
-            log.error(f"Sync failed: {e}", exc_info=True)
-            sys.exit(1)
+        if cli_scheduler:
+            log.info("CLI mode with scheduler — starting infinite sleep-run loop.")
+            try:
+                run_scheduler()
+            except KeyboardInterrupt:
+                log.info("Scheduler stopped by user.")
+                sys.exit(0)
+        else:
+            log.info("CLI mode — performing one-off sync.")
+            try:
+                sys.exit(0 if main(full_refresh=cli_full_refresh, skip_clicks=cli_skip_clicks) >= 0 else 1)
+            except Exception as e:
+                log.error(f"Sync failed: {e}", exc_info=True)
+                sys.exit(1)
+    else:
+        log.info("Server mode — starting Flask web server + background scheduler.")
+        # Start background scheduler thread
+        threading.Thread(target=run_scheduler, daemon=True).start()
 
-    # Fire initial sync in background so Flask binds the port immediately
-    threading.Thread(
-        target=_run_sync_safe, args=(cli_full_refresh, cli_skip_clicks), daemon=True
-    ).start()
+        port = int(os.environ.get("PORT", 10000))
+        log.info(f"Starting Flask on 0.0.0.0:{port}")
+        log.info("ℹ️  SIGTERM is ignored — process keeps running through Render cycles.")
+        log.info("ℹ️  Send SIGINT for a real stop.")
 
-    port = int(os.environ.get("PORT", 10000))
-    log.info(f"Starting Flask on 0.0.0.0:{port}")
-    log.info("ℹ️  SIGTERM is ignored — process keeps running through Render cycles.")
-    log.info("ℹ️  Send SIGINT for a real stop.")
-
-    # use_reloader=False prevents Flask from forking and double-starting the sync thread
-    app.run(host="0.0.0.0", port=port, use_reloader=False, threaded=True)
+        # use_reloader=False prevents Flask from forking and double-starting the sync thread
+        app.run(host="0.0.0.0", port=port, use_reloader=False, threaded=True)
