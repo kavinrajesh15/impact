@@ -573,10 +573,10 @@ def main(full_refresh: bool = False, skip_clicks: bool = False) -> int:
 # ==========================================================
 # WEEKLY SCHEDULER
 # ==========================================================
-def get_seconds_until_next_monday_12am():
-    """Calculate the exact seconds to wait until next Monday at 12:00 AM (midnight) local time."""
+def get_seconds_until_next_sunday_12am():
+    """Calculate the exact seconds to wait until next Sunday at 12:00 AM (midnight) local time."""
     now = datetime.now()
-    days_ahead = (0 - now.weekday()) % 7
+    days_ahead = (6 - now.weekday()) % 7
     target = now.replace(hour=0, minute=0, second=0, microsecond=0) + timedelta(days=days_ahead)
     if target <= now:
         target += timedelta(days=7)
@@ -586,9 +586,9 @@ def get_seconds_until_next_monday_12am():
 def run_scheduler():
     log.info("⏰ Scheduler thread started.")
     while True:
-        seconds_to_wait = get_seconds_until_next_monday_12am()
+        seconds_to_wait = get_seconds_until_next_sunday_12am()
         next_run = datetime.now() + timedelta(seconds=seconds_to_wait)
-        log.info(f"⏰ Next sync scheduled for Monday 12:00 AM (local time): {next_run.strftime('%Y-%m-%d %H:%M:%S')} (in {seconds_to_wait:.1f} seconds)")
+        log.info(f"⏰ Next sync scheduled for Sunday 12:00 AM (local time): {next_run.strftime('%Y-%m-%d %H:%M:%S')} (in {seconds_to_wait:.1f} seconds)")
         
         while seconds_to_wait > 0:
             if _hard_stop.is_set():
